@@ -1,5 +1,9 @@
 source 'https://rubygems.org'
 
-gem 'platform-api'
 gem 'pg'
+gem 'platform-api'
 gem 'rest-client'
+
+group :development do
+  gem 'standardrb'
+end

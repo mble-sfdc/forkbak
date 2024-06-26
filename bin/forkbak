@@ -9,20 +9,20 @@ $stdout.sync = true
 module Forkbak
   def self.heroku
     PlatformAPI.connect(
-      ENV.fetch("HEROKU_API_KEY"),
-      default_headers: {'Accept' => 'application/vnd.heroku+json; version=3.switzerland'}
+      ENV.fetch('HEROKU_API_KEY'),
+      default_headers: { 'Accept' => 'application/vnd.heroku+json; version=3.switzerland' }
     )
   end
 
   def self.create_database
     database_to_fork = heroku.config_var.info(ENV.fetch('FORK_FROM_APP'))['DATABASE_URL']
     heroku.addon.create(ENV['APP'], {
-      plan: "heroku-postgresql:standard-5",
-      config: {
-        fork: database_to_fork,
-        fast: true
-      }
-    })
+                          plan: 'heroku-postgresql:standard-5',
+                          config: {
+                            fork: database_to_fork,
+                            fast: true
+                          }
+                        })
   end
 
   def self.database_url(config_var)
@@ -32,7 +32,7 @@ module Forkbak
   def self.wait_for_database(config_var)
     loop do
       begin
-        resolved_database_url = self.database_url(config_var)
+        resolved_database_url = database_url(config_var)
 
         url = URI.parse(resolved_database_url)
         host = url.host
@@ -42,25 +42,26 @@ module Forkbak
           host,
           url.port || 5432,
           nil, '',
-          url.path.gsub("/",""),
+          url.path.gsub('/', ''),
           url.user,
           url.password
         ]
         conn = PG::Connection.open(*params)
-        result = conn.exec("SELECT pg_is_in_recovery()").values
+        result = conn.exec('SELECT pg_is_in_recovery()').values
         break if result[0][0] == 'f'
-        puts "still waiting, pg is in recovery"
+
+        puts 'still waiting, pg is in recovery'
       rescue PG::ConnectionBad => e
         if e.message =~ /Is the server running on host|the database system is starting up|could not connect to server/
-          puts "DB preparing"
+          puts 'DB preparing'
         elsif e.message =~ /password authentication failed for user/
-          puts "Unable to connect - bad creds? Retrying"
+          puts 'Unable to connect - bad creds? Retrying'
         elsif e.message =~ /could not translate host name/
-          puts "Unable to connect, DNS issues. Retrying"
+          puts 'Unable to connect, DNS issues. Retrying'
         else
           raise
         end
-      rescue =>e
+      rescue StandardError => e
         puts "still waiting: #{e.class}: #{e.message}"
       ensure
         conn.close if conn
@@ -70,24 +71,22 @@ module Forkbak
   end
 
   def self.create_backup(db)
-    pgbackups = Forkbak::PGBackupsClient.new(db: db)
+    pgbackups = Forkbak::PGBackupsClient.new(db:)
     loop do
-      if transfer_id = pgbackups.transfer!
-        return transfer_id
-      else
-        sleep 10
-        puts "Could not initiate transfer, retrying"
-      end
+      return transfer_id if transfer_id = pgbackups.transfer!
+
+      sleep 10
+      puts 'Could not initiate transfer, retrying'
     end
   end
 
   def self.wait_for_backup(db, transfer_id)
-    pgbackups = Forkbak::PGBackupsClient.new(db: db, transfer_id: transfer_id)
+    pgbackups = Forkbak::PGBackupsClient.new(db:, transfer_id:)
     until pgbackups.transfer_status == Forkbak::PGBackupsClient::StatusCompleted
       putc '.'
       sleep 10
     end
-    puts "Backup complete"
+    puts 'Backup complete'
   end
 
   def self.destroy_databases
@@ -107,13 +106,12 @@ module Forkbak
     end
 
     def transfer!
-
       response = JSON.parse(
         restclient_resource["/client/v11/databases/#{@db['name']}/backups"]
           .post(expire: true)
       )
       @transfer_id = response['uuid']
-    rescue => e
+    rescue StandardError => e
       puts "Error attempting transfer: ##{e.class}: #{e.message}"
       nil
     end
@@ -127,7 +125,7 @@ module Forkbak
       elsif response['finished_at']
         StatusCompleted
       end
-    rescue => e
+    rescue StandardError => e
       StatusUnknown
     end
 
@@ -135,10 +133,11 @@ module Forkbak
     StatusError     = Class.new
     StatusUnknown   = Class.new
 
-  private
+    private
+
     def restclient_resource
       @restclient_resource ||= RestClient::Resource.new(
-          "https://:#{ENV['HEROKU_API_KEY']}@shogun.heroku.com"
+        "https://:#{ENV['HEROKU_API_KEY']}@shogun.heroku.com"
       )
     end
   end
@@ -146,18 +145,18 @@ end
 
 def run
   start = Time.now
-  puts "Cleaning up leftover DBs"
+  puts 'Cleaning up leftover DBs'
   Forkbak.destroy_databases
-  puts "Creating database"
+  puts 'Creating database'
   db = Forkbak.create_database
   begin
-    puts "Waiting for database to become available"
+    puts 'Waiting for database to become available'
     Forkbak.wait_for_database(db['config_vars'].first)
-    puts "Creating backup"
+    puts 'Creating backup'
     transfer_id = Forkbak.create_backup(db)
     puts "Waiting for backup to complete (#{transfer_id})"
     Forkbak.wait_for_backup(db, transfer_id)
-  rescue => e
+  rescue StandardError => e
     puts "Failed to take backup: #{e.class} - #{e.message}\n\n#{e.backtrace.join("\n")}"
   ensure
     puts "Done, took #{Time.now - start}"
