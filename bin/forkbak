@@ -34,8 +34,14 @@ module Forkbak
   end
 
   def self.database_url(db_name)
-    return unless addon = heroku.addon.list_by_app(BACKUP_APP).find { |a| a['name'] == db_name }
-    return unless config_var = addon['config_vars'].first
+    begin
+      return unless addon = heroku.addon.list_by_app(BACKUP_APP).find { |a| a['name'] == db_name }
+      return unless config_var = addon['config_vars'].first
+    rescue OpenSSL::SSL::SSLError => e
+      puts e
+      sleep 5
+      retry
+    end
 
     heroku.config_var.info_for_app(BACKUP_APP)[config_var]
   end
@@ -74,7 +80,7 @@ module Forkbak
         end
       rescue URI::InvalidURIError => e
         puts "still waiting: #{e.class}: #{e.message}"
-        puts({ uri: database_url(db_name), db_name: }.inspect)
+        # puts({ uri: database_url(db_name), db_name: }.inspect)
       rescue StandardError => e
         puts "still waiting: #{e.class}: #{e.message}"
       ensure
@@ -85,9 +91,21 @@ module Forkbak
   end
 
   def self.create_backup(db_name)
-    pgbackups = Forkbak::PGBackupsClient.new(db_name:)
+    pgbackups = Forkbak::PGBackupsClient.new(db_name: db_name)
+    retries = 5
+
     loop do
-      transfer_id = pgbackups.transfer!
+      begin
+        transfer_id = pgbackups.transfer!
+      rescue => e
+        puts "transfer err: #{e}"
+        if retries <= 0
+          retries -= 1
+          sleep rand(0..Float(2 ** retries))
+          retry
+        end
+      end
+
       return transfer_id if transfer_id
 
       sleep 10
@@ -96,7 +114,7 @@ module Forkbak
   end
 
   def self.wait_for_backup(db_name, transfer_id)
-    pgbackups = Forkbak::PGBackupsClient.new(db_name:, transfer_id:)
+    pgbackups = Forkbak::PGBackupsClient.new(db_name: db_name, transfer_id: transfer_id)
     until pgbackups.transfer_status == Forkbak::PGBackupsClient::StatusCompleted
       putc '.'
       sleep 10
