@@ -7,6 +7,10 @@ require 'pg'
 $stdout.sync = true
 
 module Forkbak
+  FORK_FROM_APP = "#{ENV.fetch('FORK_FROM_APP')}"
+  BACKUP_APP = "#{FORK_FROM_APP}-backups"
+  BACKUP_PLAN = ENV.fetch("BACKUP_PLAN", "standard-6")
+
   def self.heroku
     PlatformAPI.connect(
       ENV.fetch('HEROKU_API_KEY'),
@@ -15,9 +19,13 @@ module Forkbak
   end
 
   def self.create_database
-    database_to_fork = heroku.config_var.info(ENV.fetch('FORK_FROM_APP'))['DATABASE_URL']
-    heroku.addon.create(ENV['APP'], {
-                          plan: 'heroku-postgresql:standard-5',
+    target_key = ENV.fetch('TARGET_DATABASE_KEY') || 'DATABASE_URL'
+    vars = heroku.config_var.info_for_app(FORK_FROM_APP)
+
+    database_to_fork = vars[target_key]
+    puts database_to_fork
+    heroku.addon.create(BACKUP_APP, {
+                          plan: 'heroku-postgresql:standard-0',
                           config: {
                             fork: database_to_fork,
                             fast: true
@@ -25,14 +33,17 @@ module Forkbak
                         })
   end
 
-  def self.database_url(config_var)
-    heroku.config_var.info(ENV.fetch('APP'))[config_var]
+  def self.database_url(db_name)
+    return unless addon = heroku.addon.list_by_app(BACKUP_APP).find {|a| a['name'] == db_name }
+    return unless config_var = addon['config_vars'].first
+
+    heroku.config_var.info_for_app(BACKUP_APP)[config_var]
   end
 
-  def self.wait_for_database(config_var)
+  def self.wait_for_database(db_name)
     loop do
       begin
-        resolved_database_url = database_url(config_var)
+        resolved_database_url = database_url(db_name)
 
         url = URI.parse(resolved_database_url)
         host = url.host
@@ -61,6 +72,9 @@ module Forkbak
         else
           raise
         end
+      rescue URI::InvalidURIError => e
+        puts "still waiting: #{e.class}: #{e.message}"
+        puts({uri: self.database_url(db_name), db_name: db_name}.inspect)
       rescue StandardError => e
         puts "still waiting: #{e.class}: #{e.message}"
       ensure
@@ -70,62 +84,70 @@ module Forkbak
     end
   end
 
-  def self.create_backup(db)
-    pgbackups = Forkbak::PGBackupsClient.new(db:)
+  def self.create_backup(db_name)
+    pgbackups = Forkbak::PGBackupsClient.new(db_name: db_name)
     loop do
-      return transfer_id if transfer_id = pgbackups.transfer!
-
-      sleep 10
-      puts 'Could not initiate transfer, retrying'
+      if transfer_id = pgbackups.transfer!
+        return transfer_id
+      else
+        sleep 10
+        puts "Could not initiate transfer, retrying"
+      end
     end
   end
 
-  def self.wait_for_backup(db, transfer_id)
-    pgbackups = Forkbak::PGBackupsClient.new(db:, transfer_id:)
+  def self.wait_for_backup(db_name, transfer_id)
+    pgbackups = Forkbak::PGBackupsClient.new(db_name: db_name, transfer_id: transfer_id)
     until pgbackups.transfer_status == Forkbak::PGBackupsClient::StatusCompleted
       putc '.'
       sleep 10
     end
-    puts 'Backup complete'
+    puts "Backup complete"
   end
 
-  def self.destroy_databases
-    heroku.addon.list(ENV.fetch('APP')).select do |addon|
-      addon['addon_service']['name'] == 'heroku-postgresql'
-    end.each do |addon|
-      heroku.addon.delete(ENV.fetch('APP'), addon['name'])
+  def self.destroy_databases(always_destroy: nil)
+    old_databases = heroku.addon.list_by_app(BACKUP_APP)
+      .select do |addon|
+        addon['addon_service']['name'] == 'heroku-postgresql' &&
+        Date.parse(addon['created_at']) < Date.today.prev_day
+      end
+      .map{ |addon| addon['name'] }
+
+    (old_databases + [always_destroy]).compact.uniq.each do |addon_name|
+      heroku.addon.delete(BACKUP_APP, addon_name)
     end
   end
 end
 
 module Forkbak
   class PGBackupsClient
-    def initialize(opts)
-      @db          = opts.fetch(:db)
-      @transfer_id = opts[:transfer_id]
+    def initialize(db_name:, transfer_id: nil)
+      @db_name     = db_name
+      @transfer_id = transfer_id
     end
 
     def transfer!
+
       response = JSON.parse(
-        restclient_resource["/client/v11/databases/#{@db['name']}/backups"]
+        restclient_resource["/client/v11/databases/#{@db_name}/backups"]
           .post(expire: true)
       )
       @transfer_id = response['uuid']
-    rescue StandardError => e
+    rescue => e
       puts "Error attempting transfer: ##{e.class}: #{e.message}"
       nil
     end
 
     def transfer_status
       response = JSON.parse(
-        restclient_resource["/client/v11/databases/#{@db['name']}/transfers/#{@transfer_id}"].get
+        restclient_resource["/client/v11/databases/#{@db_name}/transfers/#{@transfer_id}"].get
       )
       if response['errors']
         StatusError
       elsif response['finished_at']
         StatusCompleted
       end
-    rescue StandardError => e
+    rescue => e
       StatusUnknown
     end
 
@@ -133,11 +155,11 @@ module Forkbak
     StatusError     = Class.new
     StatusUnknown   = Class.new
 
-    private
+  private
 
     def restclient_resource
       @restclient_resource ||= RestClient::Resource.new(
-        "https://:#{ENV['HEROKU_API_KEY']}@shogun.heroku.com"
+          "https://:#{ENV['HEROKU_API_KEY']}@shogun.heroku.com"
       )
     end
   end
@@ -145,22 +167,23 @@ end
 
 def run
   start = Time.now
-  puts 'Cleaning up leftover DBs'
+  puts "Cleaning up leftover DBs"
   Forkbak.destroy_databases
-  puts 'Creating database'
-  db = Forkbak.create_database
+  puts "Creating database"
+  db_name = Forkbak.create_database['name']
+  puts db_name.inspect
   begin
-    puts 'Waiting for database to become available'
-    Forkbak.wait_for_database(db['config_vars'].first)
-    puts 'Creating backup'
-    transfer_id = Forkbak.create_backup(db)
+    puts "Waiting for database to become available"
+    Forkbak.wait_for_database(db_name)
+    puts "Creating backup"
+    transfer_id = Forkbak.create_backup(db_name)
     puts "Waiting for backup to complete (#{transfer_id})"
-    Forkbak.wait_for_backup(db, transfer_id)
-  rescue StandardError => e
+    Forkbak.wait_for_backup(db_name, transfer_id)
+  rescue => e
     puts "Failed to take backup: #{e.class} - #{e.message}\n\n#{e.backtrace.join("\n")}"
   ensure
     puts "Done, took #{Time.now - start}"
-    Forkbak.destroy_databases
+    Forkbak.destroy_databases(always_destroy: db_name)
   end
 end
 
